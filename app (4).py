@@ -18,7 +18,7 @@ def secret(name, default=""):
 
 TEACHER_CODE = secret("TEACHER_CODE", "TEACH-2026")
 GEMINI_KEY = secret("GEMINI_API_KEY")
-MODEL = secret("MODEL", "gemini-2.5-flash")
+MODEL = secret("MODEL", "gemini-3.8-flash")
 TZ_NAME = secret("TIMEZONE", "Africa/Cairo")
 try:
     TZ = ZoneInfo(TZ_NAME)
@@ -94,6 +94,23 @@ def read_upload(f):
         return ""
 
 
+def add_lesson(title, text, year):
+    # saving the same lesson twice must not create a second copy in the library
+    if q("select id from lessons where title=? and text=? and year=?", (title, text, year), one=True):
+        return
+    q("insert into lessons(title,text,year) values(?,?,?)", (title, text, year))
+
+
+def library(year):
+    seen, out = set(), []
+    for l in q("select * from lessons where year=? or year=-1 order by id", (year,)):
+        key = (l["title"].strip().lower(), hash(l["text"]))
+        if key not in seen:
+            seen.add(key)
+            out.append(l)
+    return out
+
+
 def seed():
     if q("select count(*) n from lessons", one=True)["n"]:
         return
@@ -113,35 +130,54 @@ seed()
 RETRY_CODES = (429, 500, 502, 503, 504)
 
 
+@st.cache_resource
+def _model_state():
+    return {"ok": None}  # remembers the model that last worked
+
+
+def model_list():
+    # the configured model first; if Google retires it (404), fall back to newer ones automatically
+    ms = [_model_state()["ok"], MODEL, "gemini-3.8-flash", "gemini-flash-latest"]
+    return [m for i, m in enumerate(ms) if m and m not in ms[:i]]
+
+
 def gen(contents, max_tokens=4000, as_json=False):
     if not GEMINI_KEY:
         raise RuntimeError("Missing GEMINI_API_KEY in the app Secrets.")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
-    cfg = {"maxOutputTokens": max(max_tokens, 8000)}
-    if as_json:
-        cfg["responseMimeType"] = "application/json"
-    if MODEL.startswith("gemini-2.5-flash"):
-        cfg["thinkingConfig"] = {"thinkingBudget": 0}  # faster answers, no output budget lost to "thinking"
-    for attempt in range(4):
-        try:
-            r = requests.post(url, headers={"x-goog-api-key": GEMINI_KEY},
-                              json={"contents": contents, "generationConfig": cfg}, timeout=120)
-        except requests.RequestException:
-            time.sleep(3 * (attempt + 1))
-            continue
-        if r.status_code in RETRY_CODES:
-            time.sleep(6 * (attempt + 1))
-            continue
-        if r.status_code != 200:
-            raise RuntimeError(f"AI error {r.status_code}: {r.text[:200]}")
-        try:
-            text = "".join(p.get("text", "") for p in r.json()["candidates"][0]["content"]["parts"])
-        except Exception:
-            text = ""
-        if not text.strip():
-            raise RuntimeError("The AI returned an empty answer. Please try again.")
-        return text
-    raise RuntimeError("The AI is busy (free-tier limit). Wait a minute and try again.")
+    missing = ""
+    for model in model_list():
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        cfg = {"maxOutputTokens": max(max_tokens, 8000)}
+        if as_json:
+            cfg["responseMimeType"] = "application/json"
+        if model.startswith("gemini-2.5-flash"):
+            cfg["thinkingConfig"] = {"thinkingBudget": 0}  # faster answers, no output budget lost to "thinking"
+        for attempt in range(4):
+            try:
+                r = requests.post(url, headers={"x-goog-api-key": GEMINI_KEY},
+                                  json={"contents": contents, "generationConfig": cfg}, timeout=120)
+            except requests.RequestException:
+                time.sleep(3 * (attempt + 1))
+                continue
+            if r.status_code == 404:  # model retired or not available to this key: try the next one
+                missing = r.text[:200]
+                break
+            if r.status_code in RETRY_CODES:
+                time.sleep(6 * (attempt + 1))
+                continue
+            if r.status_code != 200:
+                raise RuntimeError(f"AI error {r.status_code}: {r.text[:200]}")
+            try:
+                text = "".join(p.get("text", "") for p in r.json()["candidates"][0]["content"]["parts"])
+            except Exception:
+                text = ""
+            if not text.strip():
+                raise RuntimeError("The AI returned an empty answer. Please try again.")
+            _model_state()["ok"] = model
+            return text
+        else:
+            raise RuntimeError("The AI is busy (free-tier limit). Wait a minute and try again.")
+    raise RuntimeError("No Gemini model is available for this key. Set MODEL in the app Secrets to a current model name. " + missing)
 
 
 def ask(prompt, fast=False, max_tokens=4000, messages=None):
@@ -184,13 +220,14 @@ def to_int(v, d=30):
 
 # ---------------------------------------------------------------- text helpers
 def sections(t):
-    out = []
+    merged = {}  # the same lesson title can show up many times (page headers, repeated headings): keep each lesson once
     for p in re.split(r"(?m)^(?=Lesson \d+\s*:)", t):
         m = re.match(r"Lesson (\d+)\s*:\s*([^\n=.]+)", p)
         title = f"Lesson {m.group(1)}: {m.group(2).strip()}" if m else "Overview"
         if len(p.strip()) > 80:
-            out.append((title, p.strip()))
-    return out
+            key = re.sub(r"\s+", " ", title).strip().lower()
+            merged.setdefault(key, [title, []])[1].append(p.strip())
+    return [(v[0], "\n\n".join(v[1])) for v in merged.values()]
 
 
 def chunks(t, n=700):
@@ -330,11 +367,11 @@ def step_upload(u):
         if len(t) < 40:
             st.error("No readable text found (scanned PDF? paste the text instead).")
         else:
-            q("insert into lessons(title,text,year) values(?,?,?)", (title or "New lesson", t, u["year"]))
+            add_lesson(title or "New lesson", t, u["year"])
             begin(title or "New lesson", t)
             st.rerun()
     st.subheader("Library")
-    for l in q("select * from lessons where year=? or year=-1", (u["year"],)):
+    for l in library(u["year"]):
         if st.button(f"📘 {l['title']}", key=f"l{l['id']}", use_container_width=True):
             begin(l["title"], l["text"])
             st.rerun()
@@ -603,7 +640,7 @@ def chat_page():
 
 def topics(u):
     out = []
-    for l in q("select * from lessons where year=? or year=-1", (u["year"],)):
+    for l in library(u["year"]):
         s = sections(l["text"])
         out += [f"{l['title'][:30]} – {t}" for t, _ in s] if len(s) > 1 else [l["title"]]
     return list(dict.fromkeys(out))
@@ -725,7 +762,7 @@ def teacher(u):
             if len(t) < 40:
                 st.error("No readable text.")
             else:
-                q("insert into lessons(title,text,year) values(?,?,?)", (title or "New lesson", t, yr))
+                add_lesson(title or "New lesson", t, yr)
                 st.success("Saved to the library")
 
 
